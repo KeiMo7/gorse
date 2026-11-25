@@ -62,15 +62,16 @@ func init() {
 
 // Config is the configuration for the engine.
 type Config struct {
-	Database  DatabaseConfig  `mapstructure:"database"`
-	Master    MasterConfig    `mapstructure:"master"`
-	Server    ServerConfig    `mapstructure:"server"`
-	Recommend RecommendConfig `mapstructure:"recommend"`
-	Tracing   TracingConfig   `mapstructure:"tracing"`
-	OIDC      OIDCConfig      `mapstructure:"oidc"`
-	OpenAI    OpenAIConfig    `mapstructure:"openai"`
-	Blob      BlobConfig      `mapstructure:"blob"`
-	Quota     QuotaConfig     `mapstructure:"quota"`
+	Database   DatabaseConfig   `mapstructure:"database"`
+	Master     MasterConfig     `mapstructure:"master"`
+	Server     ServerConfig     `mapstructure:"server"`
+	Recommend  RecommendConfig  `mapstructure:"recommend"`
+	Tracing    TracingConfig    `mapstructure:"tracing"`
+	OIDC       OIDCConfig       `mapstructure:"oidc"`
+	OpenAI     OpenAIConfig     `mapstructure:"openai"`
+	Blob       BlobConfig       `mapstructure:"blob"`
+	Quota      QuotaConfig      `mapstructure:"quota"`
+	Versioning VersioningConfig `mapstructure:"versioning"`
 }
 
 var configMasker = func() *mask.Masker {
@@ -532,6 +533,20 @@ type QuotaConfig struct {
 	MaxCategoriesSize  int `mapstructure:"max_categories_size" validate:"gte=0"`  // Max size of Categories in bytes (0 = no limit)
 }
 
+// VersioningConfig controls recommendation version identity, targeted
+// backfill and rollback. The feature is always active; these knobs bound the
+// extra storage and concurrency it consumes.
+type VersioningConfig struct {
+	// RetainedVersions is how many old result versions are kept per user to
+	// support rollback (minimum 1).
+	RetainedVersions int `mapstructure:"retained_versions" validate:"gte=1"`
+	// BackfillConcurrency bounds how many users a backfill job processes at
+	// once, so backfill cannot starve online reads of storage/model resources.
+	BackfillConcurrency int `mapstructure:"backfill_concurrency" validate:"gte=1"`
+	// MaxBackfillFailures bounds the per-user failure records kept per task.
+	MaxBackfillFailures int `mapstructure:"max_backfill_failures" validate:"gte=0"`
+}
+
 func GetDefaultConfig() *Config {
 	return &Config{
 		Database: DatabaseConfig{
@@ -614,6 +629,11 @@ func GetDefaultConfig() *Config {
 			MaxCommentSize:     0, // No limit by default
 			MaxCategoriesCount: 0, // No limit by default
 			MaxCategoriesSize:  0, // No limit by default
+		},
+		Versioning: VersioningConfig{
+			RetainedVersions:    3,
+			BackfillConcurrency: 4,
+			MaxBackfillFailures: 1000,
 		},
 	}
 }
@@ -764,6 +784,10 @@ func setDefault() {
 	viper.SetDefault("quota.max_comment_size", defaultConfig.Quota.MaxCommentSize)
 	viper.SetDefault("quota.max_categories_count", defaultConfig.Quota.MaxCategoriesCount)
 	viper.SetDefault("quota.max_categories_size", defaultConfig.Quota.MaxCategoriesSize)
+	// [versioning]
+	viper.SetDefault("versioning.retained_versions", defaultConfig.Versioning.RetainedVersions)
+	viper.SetDefault("versioning.backfill_concurrency", defaultConfig.Versioning.BackfillConcurrency)
+	viper.SetDefault("versioning.max_backfill_failures", defaultConfig.Versioning.MaxBackfillFailures)
 }
 
 type configBinding struct {
@@ -826,6 +850,9 @@ var bindings = []configBinding{
 	{"quota.max_comment_size", "GORSE_QUOTA_MAX_COMMENT_SIZE"},
 	{"quota.max_categories_count", "GORSE_QUOTA_MAX_CATEGORIES_COUNT"},
 	{"quota.max_categories_size", "GORSE_QUOTA_MAX_CATEGORIES_SIZE"},
+	{"versioning.retained_versions", "GORSE_VERSIONING_RETAINED_VERSIONS"},
+	{"versioning.backfill_concurrency", "GORSE_VERSIONING_BACKFILL_CONCURRENCY"},
+	{"versioning.max_backfill_failures", "GORSE_VERSIONING_MAX_BACKFILL_FAILURES"},
 }
 
 // LoadConfig loads configuration from toml file.

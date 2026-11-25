@@ -47,6 +47,7 @@ import (
 	"github.com/gorse-io/gorse/storage/data"
 	"github.com/gorse-io/gorse/storage/meta"
 	"github.com/gorse-io/gorse/storage/vectors"
+	"github.com/gorse-io/gorse/versioning"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/pkg/errors"
 	"github.com/sashabaranov/go-openai"
@@ -112,6 +113,12 @@ type Master struct {
 	backgroundCancel    context.CancelFunc
 	backgroundWaitGroup sync.WaitGroup
 	reconciling         atomic.Bool
+
+	// versioning manager, rebuilt when the shared store clients are replaced.
+	versionManagerMu    sync.Mutex
+	versionManager      *versioning.Manager
+	versionManagerCache cache.Database
+	versionManagerData  data.Database
 }
 
 // NewMaster creates a master node.

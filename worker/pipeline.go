@@ -33,6 +33,7 @@ import (
 	"github.com/gorse-io/gorse/storage/cache"
 	"github.com/gorse-io/gorse/storage/data"
 	"github.com/gorse-io/gorse/storage/vectors"
+	"github.com/gorse-io/gorse/versioning"
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
 	"go.uber.org/atomic"
@@ -89,6 +90,42 @@ type Pipeline struct {
 	MatrixFactorizationMutex sync.RWMutex
 	ClickThroughRateModel    ctr.FactorizationMachines
 	dontskipColdStartUsers   bool
+
+	// versionStore is created lazily from CacheClient. It is the single
+	// writer-side counterpart of the online versioning resolver.
+	versionStore *versioning.Store
+	versionMutex sync.Mutex
+	// runVersion is the generation version for the current Recommend run.
+	runVersion versioning.Version
+	// sampleCutoff is the feedback boundary of the current run.
+	sampleCutoff time.Time
+}
+
+// VersionStore returns the lazily-initialized versioning store bound to the
+// pipeline cache client and configured retention.
+func (p *Pipeline) VersionStore() *versioning.Store {
+	p.versionMutex.Lock()
+	defer p.versionMutex.Unlock()
+	if p.versionStore == nil {
+		p.versionStore = versioning.NewStore(p.CacheClient, p.Config.Versioning.RetainedVersions)
+	}
+	return p.versionStore
+}
+
+// prepareRunVersion registers (or reuses) the generation version for a
+// Recommend run and marks it current. Equivalent re-runs resolve to the same
+// version, while any component change creates the next sequence.
+func (p *Pipeline) prepareRunVersion(ctx context.Context, modelID int64, sampleCutoff time.Time) (versioning.Version, error) {
+	components := versioning.ComponentsFromConfig(&p.Config.Recommend, modelID, sampleCutoff)
+	store := p.VersionStore()
+	version, _, err := store.GetOrRegisterVersion(ctx, components)
+	if err != nil {
+		return version, err
+	}
+	if err := store.SetCurrentVersion(ctx, version); err != nil {
+		return version, err
+	}
+	return version, nil
 }
 
 func (p *Pipeline) UpdateMatrixFactorization(
@@ -124,7 +161,18 @@ func (p *Pipeline) GetMatrixFactorization() (*logics.MatrixFactorizationUsers, i
 func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress func(completed, throughput int)) {
 	startRecommendTime := time.Now()
 	itemCache := NewItemCache(p.DataClient)
+	// The sample cutoff is the feedback boundary of this generation: feedback
+	// observed after it can only be handled by online request-time logic.
+	p.sampleCutoff = startRecommendTime.UTC()
+	runVersion, err := p.prepareRunVersion(ctx, p.GetMatrixFactorizationId(), p.sampleCutoff)
+	if err != nil {
+		log.Logger().Error("failed to prepare recommendation version", zap.Error(err))
+	}
+	p.versionMutex.Lock()
+	p.runVersion = runVersion
+	p.versionMutex.Unlock()
 	log.Logger().Info("ranking recommendation",
+		zap.Int64("version", runVersion.Sequence),
 		zap.Int("n_working_users", len(users)),
 		zap.Int("n_jobs", p.Jobs),
 		zap.Int("cache_size", p.Config.Recommend.CacheSize))
@@ -180,6 +228,11 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 		userId := user.UserId
 		// skip inactive users before max recommend period
 		if !p.checkUserActiveTime(ctx, userId) || !p.checkRecommendCacheOutOfDate(ctx, userId) {
+			return
+		}
+		// The shared versioning judge is the authoritative cross-version
+		// freshness check: users already at the current version are skipped.
+		if !p.checkVersionOutOfDate(ctx, userId) {
 			return
 		}
 		updateUserCount.Add(1)
@@ -294,7 +347,9 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			results = p.applyReplacementDecay(results, replacementPositiveItems, replacementNegativeItems)
 		}
 
-		// cache recommendation
+		// cache recommendation: write versioned rows first, then flip the
+		// single user pointer. The legacy collection is mirrored for backward
+		// compatibility with readers that have not adopted the version API.
 		if err = p.CacheClient.AddScores(ctx, cache.Recommend, userId, results); err != nil {
 			log.Logger().Error("failed to cache recommendation", zap.Error(err))
 			return
@@ -311,6 +366,12 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			cache.String(cache.Key(cache.RecommendDigest, userId), digest),
 		); err != nil {
 			log.Logger().Error("failed to cache recommendation time", zap.Error(err))
+		}
+		// Versioned commit. A failure here must not delete the usable legacy
+		// results written above, so it is logged and the user keeps serving.
+		if vErr := p.VersionStore().CommitResult(ctx, userId, runVersion, results, false, digest); vErr != nil {
+			log.Logger().Error("failed to commit versioned recommendation",
+				zap.String("user_id", userId), zap.Int64("version", runVersion.Sequence), zap.Error(vErr))
 		}
 	}); err != nil {
 		log.Logger().Error("recommendation was cancelled", zap.Error(err))
@@ -407,6 +468,41 @@ func (p *Pipeline) checkRecommendCacheOutOfDate(ctx context.Context, userId stri
 		return timeoutTime.Before(time.Now())
 	}
 	return true
+}
+
+// checkVersionOutOfDate applies the same versioning freshness judge used by
+// the online reader. A user that is fresh for the current version is skipped;
+// missing, stale or rollback-served users are recomputed. Any metadata error
+// degrades to "out of date" so a bad pointer never freezes a user on old data.
+func (p *Pipeline) checkVersionOutOfDate(ctx context.Context, userId string) bool {
+	store := p.VersionStore()
+	current, err := store.CurrentVersion(ctx)
+	if err != nil || current == nil {
+		return true
+	}
+	pointer, err := store.ReadUserPointer(ctx, userId)
+	if err != nil || pointer == nil {
+		return true
+	}
+	rollback, err := store.Rollback(ctx)
+	if err != nil {
+		return true
+	}
+	if rollback != nil && rollback.InScope(userId) {
+		// While a rollback is active for this user, do not recompute: the
+		// rollback window must not be disturbed by a full/partial recalculation.
+		return false
+	}
+	userRollback, err := store.UserRollback(ctx, userId)
+	if err != nil {
+		return true
+	}
+	if userRollback != nil {
+		return false
+	}
+	judge := versioning.NewJudge(store, p.Config.Recommend.CacheExpire)
+	verdict := judge.Evaluate(ctx, userId, pointer, nil, current)
+	return verdict.State != versioning.StateFresh
 }
 
 func (p *Pipeline) updateCollaborativeRecommend(

@@ -249,6 +249,9 @@ func (m *Master) CreateWebService() {
 		Param(ws.QueryParameter("user-id", "identifier of the user").DataType("string")).
 		Returns(http.StatusOK, "OK", RerankerPrompt{}).
 		Writes(RerankerPrompt{}))
+
+	// recommendation versioning, targeted backfill and rollback endpoints.
+	m.registerVersioningRoutes(ws)
 }
 
 // SinglePageAppFileSystem is the file system for single page app.

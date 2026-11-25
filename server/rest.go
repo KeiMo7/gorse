@@ -23,6 +23,7 @@ import (
 	"net/http/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"uuid"
 
@@ -73,6 +74,10 @@ type RestServer struct {
 	DisableLog bool
 	WebService *restful.WebService
 	HttpServer *http.Server
+
+	// versionBox lazily holds the versioning resolver; versionMu guards it.
+	versionBox *versioningBox
+	versionMu  sync.Mutex
 }
 
 type CountingReadCloser struct {
@@ -603,6 +608,17 @@ func (s *RestServer) CreateWebService() {
 		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
 		Returns(http.StatusOK, "OK", []string{}).
 		Writes([]string{}))
+	ws.Route(ws.GET("/recommend/{user-id}/explain").To(s.getRecommendExplain).
+		Doc("Get recommendation with version, freshness, fallback and online augmentation explanation.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.HeaderParameter("X-API-Version", "API version (set to 2 to return scores)").DataType("string")).
+		Param(ws.PathParameter("user-id", "User ID").DataType("string")).
+		Param(ws.QueryParameter("category", "Category of the returned items").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Returns(http.StatusOK, "OK", recommendExplanation{}).
+		Writes(recommendExplanation{}))
 	ws.Route(ws.POST("/session/recommend").To(s.sessionRecommend).
 		Doc("Get recommendation for session.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
@@ -1057,12 +1073,34 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 			}
 		}
 	}
+	// Additive version/freshness headers. They never alter the response body,
+	// status code, order, count or paging, so legacy clients are unaffected.
+	s.addVersionHeaders(request, response)
 	// Send result
 	if apiVersion == "2" {
 		Ok(response, scores)
 		return
 	}
 	Ok(response, results)
+}
+
+// addVersionHeader best-effort attaches version freshness headers to a legacy
+// recommend response. Any versioning error is ignored to preserve the existing
+// endpoint's behavior and availability.
+func (s *RestServer) addVersionHeaders(request *restful.Request, response *restful.Response) {
+	defer func() { _ = recover() }()
+	ctx := request.Request.Context()
+	userId := request.PathParameter("user-id")
+	box := s.versioning()
+	resolved, err := box.resolver.Resolve(ctx, userId, ReadCategories(request, nil), 0, s.Config.Recommend.CacheSize)
+	if err != nil || resolved == nil {
+		return
+	}
+	response.AddHeader("X-Gorse-Version-Sequence", strconv.FormatInt(resolved.Effective.Sequence, 10))
+	response.AddHeader("X-Gorse-Freshness", resolved.Freshness.State)
+	if resolved.Effective.Rollback {
+		response.AddHeader("X-Gorse-Rollback", "true")
+	}
 }
 
 func (s *RestServer) sessionRecommend(request *restful.Request, response *restful.Response) {

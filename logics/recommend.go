@@ -54,7 +54,36 @@ type Recommender struct {
 	userFeedback []data.Feedback
 	categories   []string
 	excludeSet   mapset.Set[string]
+
+	// explain, when enabled, records the provenance of every returned item
+	// without changing the recommendation content, order or count.
+	explain bool
+	// provenance maps an item id to the recommender that produced it.
+	provenance map[string]string
+	// chainUsage records, in order, every recommender invoked through
+	// RecommendSequential together with the number of items it contributed.
+	chainUsage []ChainContribution
+	// finalScores holds the post-filter scores for the explain builder.
+	finalScores []cache.Score
+	// offlineFiltered counts offline candidates removed by request-time
+	// feedback filtering during RecommendFromOffline.
+	offlineFiltered int
 }
+
+// ChainContribution describes how many items one recommender contributed.
+type ChainContribution struct {
+	Source string `json:"source"`
+	Count  int    `json:"count"`
+}
+
+// Source labels used in the explain output. They are part of the observable
+// contract and never contain feedback text or raw item labels.
+const (
+	SourceOffline       = "offline"
+	SourceFallback      = "fallback"
+	SourceOnlineLatest  = "online/latest"
+	SourceOnlineSession = "online/session"
+)
 
 type RecommenderFunc func(ctx context.Context) ([]cache.Score, string, error)
 
@@ -89,7 +118,79 @@ func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, d
 		coldstart:    coldstart,
 		categories:   categories,
 		excludeSet:   excludeSet,
+		provenance:   make(map[string]string),
 	}, nil
+}
+
+// EnableExplain turns on provenance tracking. It must be called before
+// Recommend; tracking is opt-in so the default path allocates nothing extra.
+func (r *Recommender) EnableExplain() *Recommender {
+	r.explain = true
+	if r.provenance == nil {
+		r.provenance = make(map[string]string)
+	}
+	return r
+}
+
+// ExplainEnabled reports whether provenance tracking is active.
+func (r *Recommender) ExplainEnabled() bool { return r.explain }
+
+// Provenance returns the source label recorded for an item, or "".
+func (r *Recommender) Provenance(itemId string) string { return r.provenance[itemId] }
+
+// ChainUsage returns the per-recommender contributions gathered so far.
+func (r *Recommender) ChainUsage() []ChainContribution {
+	return append([]ChainContribution(nil), r.chainUsage...)
+}
+
+// LatestFeedbackTime returns the most recent feedback timestamp observed when
+// the recommender was built, i.e. the online boundary. Zero means no feedback.
+func (r *Recommender) LatestFeedbackTime() time.Time {
+	var latest time.Time
+	for _, feedback := range r.userFeedback {
+		if feedback.Timestamp.After(latest) {
+			latest = feedback.Timestamp
+		}
+	}
+	return latest
+}
+
+// rememberFinal stores the final post-filter scores so the explain builder can
+// map only returned items to their provenance.
+func (r *Recommender) rememberFinal(scores []cache.Score) {
+	if !r.explain {
+		return
+	}
+	r.finalScores = append(r.finalScores[:0], scores...)
+}
+
+// RememberFinal is the exported entry used by online handlers to record the
+// final, offset-adjusted scores before building the explain response.
+func (r *Recommender) RememberFinal(scores []cache.Score) {
+	r.rememberFinal(scores)
+}
+
+// ExplainedScores returns the final scores captured for the explain output.
+func (r *Recommender) ExplainedScores() []cache.Score {
+	return append([]cache.Score(nil), r.finalScores...)
+}
+
+// recordProvenance tags each item with its producing recommender. In explain
+// mode only; otherwise it is a cheap no-op.
+func (r *Recommender) recordProvenance(source string, items []cache.Score) {
+	if !r.explain {
+		return
+	}
+	contributed := 0
+	for _, item := range items {
+		if _, exists := r.provenance[item.Id]; !exists {
+			r.provenance[item.Id] = source
+			contributed++
+		}
+	}
+	if contributed > 0 {
+		r.chainUsage = append(r.chainUsage, ChainContribution{Source: source, Count: contributed})
+	}
 }
 
 func (r *Recommender) ExcludeSet() mapset.Set[string] {
@@ -117,6 +218,7 @@ func (r *Recommender) Recommend(ctx context.Context, limit int) (result []cache.
 				result = append(result, score)
 			}
 		}
+		r.recordProvenance(SourceOffline, result)
 	} else {
 		result, _, err = r.RecommendSequential(ctx, result, r.config.CacheSize, r.config.Ranker.Recommenders...)
 		if err != nil {
@@ -128,6 +230,50 @@ func (r *Recommender) Recommend(ctx context.Context, limit int) (result []cache.
 	}
 	result, _, err = r.RecommendSequential(ctx, result, limit, r.config.Fallback.Recommenders...)
 	return result, errors.WithStack(err)
+}
+
+// RecommendFromOffline behaves like Recommend but treats the supplied
+// pre-loaded offline scores (read through the versioning resolver) as the
+// offline source instead of re-reading the legacy collection. It is used by
+// the version-aware online path; content, order, count and fallback semantics
+// are identical to Recommend.
+func (r *Recommender) RecommendFromOffline(ctx context.Context, offline []cache.Score, limit int) (result []cache.Score, err error) {
+	// Count request-time filtered offline candidates before the offline set
+	// itself is added to the exclude set.
+	r.offlineFiltered = countExcluded(r.excludeSet, offline)
+	result = make([]cache.Score, 0, len(offline))
+	for _, score := range offline {
+		if !r.excludeSet.Contains(score.Id) {
+			r.excludeSet.Add(score.Id)
+			result = append(result, score)
+		}
+	}
+	r.recordProvenance(SourceOffline, result)
+	if limit > 0 && len(result) >= limit {
+		return result[:limit], nil
+	}
+	if limit <= 0 {
+		// No bound: still allow fallback to enrich, matching Recommend(0).
+		limit = r.config.CacheSize
+	}
+	result, _, err = r.RecommendSequential(ctx, result, limit, r.config.Fallback.Recommenders...)
+	return result, errors.WithStack(err)
+}
+
+// OfflineFiltered returns the number of offline candidates removed by
+// request-time feedback filtering during the last RecommendFromOffline call.
+func (r *Recommender) OfflineFiltered() int { return r.offlineFiltered }
+
+// countExcluded counts offline candidates already present in the request-time
+// exclude set (i.e. items interacted with after the offline sample cutoff).
+func countExcluded(excludeSet mapset.Set[string], offline []cache.Score) int {
+	filtered := 0
+	for _, score := range offline {
+		if excludeSet.Contains(score.Id) {
+			filtered++
+		}
+	}
+	return filtered
 }
 
 // RecommendSequential recommend items from multiple recommenders sequentially util reaching the limit.
@@ -146,6 +292,10 @@ func (r *Recommender) RecommendSequential(ctx context.Context, result []cache.Sc
 		for _, score := range scores {
 			r.excludeSet.Add(score.Id)
 		}
+		// Tag every newly contributed item with its producing recommender.
+		// The fallback chain is labeled distinctly so the response can show
+		// which chain filled a short offline result set.
+		r.recordProvenance(r.chainSourceLabel(name), scores)
 		result = append(result, scores...)
 		digests = append(digests, digest)
 		if limit > 0 && len(result) >= limit {
@@ -153,6 +303,19 @@ func (r *Recommender) RecommendSequential(ctx context.Context, result []cache.Sc
 		}
 	}
 	return result, util.MD5(digests...), nil
+}
+
+// chainSourceLabel maps a recommender name to an explain source label. The
+// "latest" recommender reads the live data store at request time, so it is
+// reported as an online augmentation rather than a cached fallback.
+func (r *Recommender) chainSourceLabel(name string) string {
+	if name == LatestRecommender {
+		return SourceOnlineLatest
+	}
+	if r.online {
+		return SourceFallback + "/" + name
+	}
+	return name
 }
 
 func (r *Recommender) parse(fullname string) (RecommenderFunc, error) {

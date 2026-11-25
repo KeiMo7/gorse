@@ -482,3 +482,17 @@ max_categories_count = 0
 
 # Maximum size of Categories JSON in bytes. Multi-byte UTF-8 characters count by bytes. 0 means no limit.
 max_categories_size = 0
+
+[versioning]
+
+# Number of old recommendation versions retained per user so results can be
+# rolled back to a previous version without a full recomputation.
+retained_versions = 3
+
+# Maximum number of users processed in parallel by a targeted backfill job.
+# Bounds the load backfill and rollback place on shared online storage/model
+# resources so serving reads are not starved.
+backfill_concurrency = 4
+
+# Maximum number of per-user failure records retained for one backfill task.
+max_backfill_failures = 1000
