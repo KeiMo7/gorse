@@ -1026,15 +1026,28 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 		InternalServerError(response, err)
 		return
 	}
+	// The serving side owns the single engine invocation for the final
+	// recommendation: it re-validates the generated sequence against the
+	// current consumed-state and diversity configuration.
+	diversityEnabled := s.Config.Recommend.Diversity.Enabled()
+	if diversityEnabled {
+		recommender.SkipStructuralConstraint()
+	}
 	scores, err := recommender.Recommend(ctx, n+offset)
 	if err != nil {
 		InternalServerError(response, err)
 		return
 	}
+	if diversityEnabled {
+		s.revalidateDiversity(ctx, response, userId, recommender, &scores)
+	}
 	if len(scores) > offset {
 		scores = scores[offset:]
 	} else {
 		scores = []cache.Score{}
+	}
+	if len(scores) > n {
+		scores = scores[:n]
 	}
 	results := lo.Map(scores, func(item cache.Score, index int) string {
 		return item.Id
@@ -1063,6 +1076,77 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 		return
 	}
 	Ok(response, results)
+}
+
+// revalidateDiversity applies the single constraint engine on the serving
+// side, combining the user's current consumed-state with the generated
+// sequence. Missing or stale generation artifacts trigger a flagged
+// re-constraint instead of being returned as if they were constrained. The
+// folding/relaxation report is attached as an additive response header.
+func (s *RestServer) revalidateDiversity(
+	ctx context.Context,
+	response *restful.Response,
+	userId string,
+	recommender *logics.Recommender,
+	scores *[]cache.Score,
+) {
+	engine, err := logics.NewConstraintEngine(s.Config.Recommend.Diversity)
+	if err != nil || engine == nil {
+		if err != nil {
+			log.Logger().Error("failed to compile diversity constraint on serving side", zap.Error(err))
+		}
+		return
+	}
+	degraded := false
+	storedReport, reportErr := s.CacheClient.Get(ctx, cache.Key(cache.RecommendConstraintReport, userId)).String()
+	if reportErr != nil || storedReport == "" {
+		degraded = true
+	} else {
+		var artifact logics.ConstraintReport
+		if jsonErr := json.Unmarshal([]byte(storedReport), &artifact); jsonErr != nil ||
+			artifact.ConfigHash != s.Config.Recommend.Diversity.Hash() {
+			degraded = true
+		}
+	}
+	items, err := recommender.LoadConstraintItems(ctx, *scores)
+	if err != nil {
+		log.Logger().Error("failed to load items for serving-side diversity constraint", zap.Error(err))
+		return
+	}
+	consumed := make(map[string]struct{})
+	consumedIds := make([]string, 0)
+	for _, feedback := range recommender.UserFeedback() {
+		consumed[feedback.ItemId] = struct{}{}
+		consumedIds = append(consumedIds, feedback.ItemId)
+	}
+	// Pre-resolve consumed group keys: consumed members were already excluded
+	// from the candidate list, but their whole de-duplication group must still
+	// diffuse away.
+	consumedGroupKeys := make(map[string]struct{})
+	if consumedRecords, itemErr := s.DataClient.BatchGetItems(ctx, lo.Uniq(consumedIds), data.GetOptions{}); itemErr != nil {
+		log.Logger().Error("failed to load consumed items for diversity constraint", zap.Error(itemErr))
+	} else {
+		for _, item := range consumedRecords {
+			consumedGroupKeys[engine.ResolveGroupKey(item)] = struct{}{}
+		}
+	}
+	constrained, report := engine.ApplyWithConsumedGroups(*scores, items, consumed, consumedGroupKeys, 0)
+	if degraded {
+		report.Degraded = true
+		DiversityRequestDegradedTotal.Set(1)
+	} else {
+		DiversityRequestDegradedTotal.Set(0)
+	}
+	DiversityRequestFoldedTotal.Set(float64(report.Folded))
+	if report.Exhausted {
+		DiversityRequestExhaustedTotal.Set(1)
+	} else {
+		DiversityRequestExhaustedTotal.Set(0)
+	}
+	*scores = constrained
+	if reportBytes, marshalErr := json.Marshal(report); marshalErr == nil {
+		response.Header().Set(logics.ConstraintReportHeader, string(reportBytes))
+	}
 }
 
 func (s *RestServer) sessionRecommend(request *restful.Request, response *restful.Response) {

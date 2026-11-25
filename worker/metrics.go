@@ -45,4 +45,35 @@ var (
 		Subsystem: "worker",
 		Name:      "memory_inuse_bytes",
 	}, []string{LabelData})
+
+	// DiversityConstraintFoldedTotal counts candidates removed by the
+	// structural de-duplication key during recommendation generation.
+	DiversityConstraintFoldedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "worker",
+		Name:      "diversity_constraint_folded_total",
+	})
+	// DiversityConstraintExhaustedTotal counts generation runs that could not
+	// fill the candidate sequence under the configured budgets.
+	DiversityConstraintExhaustedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "worker",
+		Name:      "diversity_constraint_exhausted_total",
+	})
+	// DiversityConstraintRelaxTotal counts how often each relaxation level
+	// (consecutive, ratio, count) was applied during generation.
+	DiversityConstraintRelaxTotal = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "worker",
+		Name:      "diversity_constraint_relax_total",
+	}, []string{LabelLevel})
+	// DiversityConstraintKeyFailureTotal counts items whose de-duplication key
+	// expression could not be evaluated during generation.
+	DiversityConstraintKeyFailureTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "worker",
+		Name:      "diversity_constraint_key_failure_total",
+	})
 )
+
+const LabelLevel = "level"

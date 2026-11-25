@@ -23,6 +23,7 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/gorse-io/gorse/common/expression"
 	"github.com/gorse-io/gorse/common/heap"
+	"github.com/gorse-io/gorse/common/log"
 	"github.com/gorse-io/gorse/common/util"
 	"github.com/gorse-io/gorse/config"
 	"github.com/gorse-io/gorse/storage"
@@ -31,6 +32,7 @@ import (
 	"github.com/gorse-io/gorse/storage/vectors"
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
+	"go.uber.org/zap"
 )
 
 const (
@@ -54,9 +56,22 @@ type Recommender struct {
 	userFeedback []data.Feedback
 	categories   []string
 	excludeSet   mapset.Set[string]
+
+	// LastConstraintReport is the folding/relaxation report of the most recent
+	// Recommend call. It is nil when the structural constraint is disabled.
+	LastConstraintReport *ConstraintReport
+
+	// skipStructuralConstraint lets the serving side take over constraint
+	// enforcement itself, so the engine never runs twice on one request.
+	skipStructuralConstraint bool
 }
 
 type RecommenderFunc func(ctx context.Context) ([]cache.Score, string, error)
+
+// ConstraintReportHeader carries the JSON-serialized ConstraintReport through
+// an HTTP response without changing the response body, so legacy clients keep
+// byte-identical payloads.
+const ConstraintReportHeader = "X-Gorse-Constraint-Report"
 
 func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, dataClient data.Database, vectorClient vectors.Database, online bool, userId string, categories []string) (*Recommender, error) {
 	// Load user feedback
@@ -123,11 +138,120 @@ func (r *Recommender) Recommend(ctx context.Context, limit int) (result []cache.
 			return nil, errors.WithStack(err)
 		}
 	}
-	if len(result) >= limit && limit > 0 {
-		return result[:limit], nil
+	// When structural constraints are enabled, always gather the full
+	// candidate window (bounded by CacheSize, never a full-library scan) so
+	// budgets and folding see every available candidate regardless of the
+	// requested page size. Without constraints the legacy short-circuit is
+	// preserved exactly.
+	fetchLimit := limit
+	if r.config.Diversity.Enabled() {
+		fetchLimit = r.config.CacheSize
 	}
-	result, _, err = r.RecommendSequential(ctx, result, limit, r.config.Fallback.Recommenders...)
-	return result, errors.WithStack(err)
+	if len(result) >= fetchLimit && fetchLimit > 0 {
+		result = result[:fetchLimit]
+	} else {
+		result, _, err = r.RecommendSequential(ctx, result, fetchLimit, r.config.Fallback.Recommenders...)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+	}
+	// Structural de-duplication and diversity budgets are the single final
+	// stage shared by every link (main ranking, fallback, replacements and
+	// external sources have already been merged above). On the serving side
+	// the caller re-runs the same engine with fresh consumed-state and
+	// degradation handling, so it is skipped here to avoid double folding.
+	if r.skipStructuralConstraint {
+		if limit > 0 && len(result) > limit {
+			return result[:limit], nil
+		}
+		return result, nil
+	}
+	// The engine enforces budgets over the full request position and records
+	// exhaustion when the feasible output is shorter than the request.
+	constrained, err := r.applyConstraints(ctx, result, limit)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && len(constrained) > limit {
+		return constrained[:limit], nil
+	}
+	return constrained, nil
+}
+
+// SkipStructuralConstraint marks this recommender as externally constrained.
+// The serving-side re-validation owns the single engine invocation then.
+func (r *Recommender) SkipStructuralConstraint() {
+	r.skipStructuralConstraint = true
+}
+
+// applyConstraints runs the single constraint engine over the merged
+// candidates. When no de-duplication key and no budget are configured it is a
+// pure pass-through, preserving the legacy output item by item.
+func (r *Recommender) applyConstraints(ctx context.Context, result []cache.Score, limit int) ([]cache.Score, error) {
+	r.LastConstraintReport = nil
+	if !r.config.Diversity.Enabled() {
+		if limit > 0 && len(result) > limit {
+			return result[:limit], nil
+		}
+		return result, nil
+	}
+	engine, err := NewConstraintEngine(r.config.Diversity)
+	if err != nil {
+		// An invalid expression must not have survived config loading, but if
+		// it does, fail open to the unconstrained list rather than the request.
+		log.Logger().Error("failed to compile diversity constraint, returning unconstrained result", zap.Error(err))
+		if limit > 0 && len(result) > limit {
+			return result[:limit], nil
+		}
+		return result, nil
+	}
+	if engine == nil {
+		if limit > 0 && len(result) > limit {
+			return result[:limit], nil
+		}
+		return result, nil
+	}
+	items, err := r.LoadConstraintItems(ctx, result)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	consumed := make(map[string]struct{})
+	consumedIds := make([]string, 0)
+	for _, feedback := range r.userFeedback {
+		consumed[feedback.ItemId] = struct{}{}
+		consumedIds = append(consumedIds, feedback.ItemId)
+	}
+	// Resolve consumed group keys explicitly: excludeSet already removed the
+	// consumed members, but group diffusion must still fold the surviving
+	// representatives of the same group.
+	consumedGroupKeys := make(map[string]struct{})
+	consumedRecords, err := r.dataClient.BatchGetItems(ctx, lo.Uniq(consumedIds), data.GetOptions{})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, item := range consumedRecords {
+		consumedGroupKeys[engine.ResolveGroupKey(item)] = struct{}{}
+	}
+	constrained, report := engine.ApplyWithConsumedGroups(result, items, consumed, consumedGroupKeys, limit)
+	r.LastConstraintReport = report
+	return constrained, nil
+}
+
+// LoadConstraintItems resolves item attributes for constraint candidates in a
+// single batch call. It only touches candidates already in hand; there is no
+// full-library scan.
+func (r *Recommender) LoadConstraintItems(ctx context.Context, scores []cache.Score) (map[string]data.Item, error) {
+	ids := make([]string, 0, len(scores))
+	for _, score := range scores {
+		ids = append(ids, score.Id)
+	}
+	items, err := r.dataClient.BatchGetItems(ctx, ids, data.GetOptions{})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return lo.SliceToMap(items, func(item data.Item) (string, data.Item) {
+		return item.ItemId, item
+	}), nil
 }
 
 // RecommendSequential recommend items from multiple recommenders sequentially util reaching the limit.

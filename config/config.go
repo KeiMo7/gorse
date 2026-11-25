@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -213,6 +214,68 @@ type RecommendConfig struct {
 	Replacement     ReplacementConfig       `mapstructure:"replacement"`
 	Ranker          RankerConfig            `mapstructure:"ranker"`
 	Fallback        FallbackConfig          `mapstructure:"fallback"`
+	Diversity       DiversityConfig         `mapstructure:"diversity"`
+}
+
+const (
+	// MultiLabelAll counts a multi-category item against every category budget.
+	MultiLabelAll = "all"
+	// MultiLabelPrimary counts a multi-category item against its first category only.
+	MultiLabelPrimary = "primary"
+)
+
+// DiversityConfig configures structural de-duplication and diversity budgets
+// applied by the single constraint engine shared by the generation (worker)
+// and serving (master/server) sides.
+type DiversityConfig struct { // DedupKey is an item expression evaluated to the de-duplication group key.
+	// When empty, no de-duplication is performed (legacy behavior).
+	DedupKey string `mapstructure:"dedup_key" validate:"item_expr"`
+	// MultiLabel decides how items belonging to several categories consume the
+	// category budgets: "all" counts the item against every category,
+	// "primary" counts it against the first category only.
+	MultiLabel string `mapstructure:"multi_label" validate:"omitempty,oneof=all primary"`
+	// Categories holds per-category budgets. Categories absent from the map are
+	// only bounded by the global limits.
+	Categories []CategoryBudget `mapstructure:"categories" validate:"dive"`
+}
+
+// CategoryBudget is the diversity budget of a category.
+type CategoryBudget struct {
+	Name           string  `mapstructure:"name" json:"name"`
+	MaxCount       int     `mapstructure:"max_count" validate:"gte=0"`
+	MaxRatio       float64 `mapstructure:"max_ratio" validate:"gte=0,lte=1"`
+	MaxConsecutive int     `mapstructure:"max_consecutive" validate:"gte=0"`
+}
+
+// Enabled reports whether any structural constraint is configured.
+func (c DiversityConfig) Enabled() bool {
+	return c.DedupKey != "" || len(c.Categories) > 0
+}
+
+// Hash summarizes the diversity configuration so cached recommendations
+// produced under an older configuration can be detected as out of date.
+func (c DiversityConfig) Hash() string {
+	hash := md5.New()
+	hash.Write([]byte(c.DedupKey))
+	hash.Write([]byte(c.MultiLabel))
+	for _, category := range c.Categories {
+		hash.Write([]byte(category.Name))
+		hash.Write([]byte(strconv.Itoa(category.MaxCount)))
+		hash.Write([]byte(strconv.FormatFloat(category.MaxRatio, 'f', -1, 64)))
+		hash.Write([]byte(strconv.Itoa(category.MaxConsecutive)))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// CategoryBudgetConfig returns the budget of the given category and whether it
+// is explicitly configured.
+func (c DiversityConfig) CategoryBudgetConfig(category string) (CategoryBudget, bool) {
+	for _, budget := range c.Categories {
+		if budget.Name == category {
+			return budget, true
+		}
+	}
+	return CategoryBudget{}, false
 }
 
 func (r *RecommendConfig) ListRecommenders() []string {
@@ -284,6 +347,7 @@ func (r *RecommendConfig) Hash() string {
 	if recommenders.Contains("latest") {
 		digests = append(digests, "latest")
 	}
+	digests = append(digests, r.Diversity.Hash())
 	return util.MD5(digests...)
 }
 
@@ -599,6 +663,9 @@ func GetDefaultConfig() *Config {
 				OptimizeTrials: 10,
 				Recommenders:   []string{"latest"},
 			},
+			Diversity: DiversityConfig{
+				MultiLabel: MultiLabelAll,
+			},
 		},
 		Tracing: TracingConfig{
 			Exporter: "otlp",
@@ -752,6 +819,8 @@ func setDefault() {
 	viper.SetDefault("recommend.ranker.recommenders", defaultConfig.Recommend.Ranker.Recommenders)
 	// [recommend.fallback]
 	viper.SetDefault("recommend.fallback", defaultConfig.Recommend.Fallback)
+	// [recommend.diversity]
+	viper.SetDefault("recommend.diversity.multi_label", defaultConfig.Recommend.Diversity.MultiLabel)
 	// [tracing]
 	viper.SetDefault("tracing.exporter", defaultConfig.Tracing.Exporter)
 	viper.SetDefault("tracing.sampler", defaultConfig.Tracing.Sampler)
@@ -1068,6 +1137,17 @@ func (config *Config) Validate() error {
 	}
 	if err := checkRecommenders(config.Recommend.Fallback.Recommenders); err != nil {
 		return err
+	}
+	// Check diversity budgets.
+	diversityCategoryNames := mapset.NewSet[string]()
+	for _, budget := range config.Recommend.Diversity.Categories {
+		if budget.Name == "" {
+			return errors.New("recommend.diversity.categories[].name must not be empty")
+		}
+		if diversityCategoryNames.Contains(budget.Name) {
+			return errors.Errorf("diversity budget of category %v is duplicated", budget.Name)
+		}
+		diversityCategoryNames.Add(budget.Name)
 	}
 	return nil
 }

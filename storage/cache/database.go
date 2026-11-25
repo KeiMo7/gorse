@@ -43,6 +43,9 @@ const (
 	Recommend                        = "recommend"
 	RecommendDigest                  = "recommend_digest"
 	RecommendUpdateTime              = "recommend_update_time"
+	// RecommendConstraintReport stores the JSON folding/relaxation report
+	// produced when the recommendation sequence was generated.
+	RecommendConstraintReport = "recommend_constraint_report"
 
 	// ItemCategories is the set of item categories. The format of key:
 	//	Global item categories - item_categories

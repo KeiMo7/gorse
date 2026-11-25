@@ -25,4 +25,26 @@ var (
 		Subsystem: "server",
 		Name:      "rest_api_request_seconds",
 	}, []string{"api"})
+
+	// DiversityRequestFoldedTotal counts items folded per serving request by
+	// the structural constraint engine.
+	DiversityRequestFoldedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "server",
+		Name:      "diversity_request_folded_total",
+	})
+	// DiversityRequestExhaustedTotal counts serving requests that returned
+	// fewer items than requested under the diversity budgets.
+	DiversityRequestExhaustedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "server",
+		Name:      "diversity_request_exhausted_total",
+	})
+	// DiversityRequestDegradedTotal counts serving requests where the stored
+	// generation artifact was missing or produced under another configuration.
+	DiversityRequestDegradedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "server",
+		Name:      "diversity_request_degraded_total",
+	})
 )

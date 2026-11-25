@@ -16,6 +16,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
@@ -294,6 +295,52 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			results = p.applyReplacementDecay(results, replacementPositiveItems, replacementNegativeItems)
 		}
 
+		// Apply the single structural constraint engine (de-duplication key,
+		// representative selection and diversity budgets) after all links have
+		// been merged, including replacement items and external sources.
+		var constraintReport *logics.ConstraintReport
+		if p.Config.Recommend.Diversity.Enabled() {
+			engine, engineErr := logics.NewConstraintEngine(p.Config.Recommend.Diversity)
+			if engineErr != nil {
+				log.Logger().Error("failed to compile diversity constraint, caching unconstrained result", zap.Error(engineErr))
+			} else if engine != nil {
+				constraintItems, itemsErr := itemCache.GetMap(ctx, lo.Map(results, func(score cache.Score, _ int) string {
+					return score.Id
+				}))
+				if itemsErr != nil {
+					log.Logger().Error("failed to load items for diversity constraint", zap.String("user_id", userId), zap.Error(itemsErr))
+					return
+				}
+				itemMap := lo.MapValues(constraintItems, func(item *data.Item, _ string) data.Item {
+					return *item
+				})
+				consumedItems := make(map[string]struct{})
+				consumedIds := make([]string, 0)
+				for _, feedback := range recommender.UserFeedback() {
+					consumedItems[feedback.ItemId] = struct{}{}
+					consumedIds = append(consumedIds, feedback.ItemId)
+				}
+				// Members of consumed groups were filtered out of the
+				// candidate list by excludeSet upstream. Resolve their group
+				// keys explicitly so group diffusion still folds the surviving
+				// representatives of the same de-duplication group.
+				consumedGroupKeys := make(map[string]struct{})
+				if consumedItemRecords, cacheErr := itemCache.GetSlice(ctx, lo.Uniq(consumedIds)); cacheErr != nil {
+					log.Logger().Error("failed to load consumed items for diversity constraint", zap.String("user_id", userId), zap.Error(cacheErr))
+				} else {
+					for _, item := range consumedItemRecords {
+						consumedGroupKeys[engine.ResolveGroupKey(*item)] = struct{}{}
+					}
+				}
+				// limit <= 0 constrains the whole generated sequence; paging
+				// budgets are computed over the full sequence on the serving
+				// side instead of being reset per page.
+				results, constraintReport = engine.ApplyWithConsumedGroups(results, itemMap, nil, consumedGroupKeys, 0)
+				// Observability failures must never affect the recommendation.
+				p.recordConstraintMetrics(userId, constraintReport)
+			}
+		}
+
 		// cache recommendation
 		if err = p.CacheClient.AddScores(ctx, cache.Recommend, userId, results); err != nil {
 			log.Logger().Error("failed to cache recommendation", zap.Error(err))
@@ -311,6 +358,19 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			cache.String(cache.Key(cache.RecommendDigest, userId), digest),
 		); err != nil {
 			log.Logger().Error("failed to cache recommendation time", zap.Error(err))
+		}
+		// Store the folding/relaxation report next to the sequence. A failure
+		// to persist the report never blocks recommendation generation.
+		if constraintReport != nil {
+			if reportBytes, reportErr := json.Marshal(constraintReport); reportErr != nil {
+				log.Logger().Error("failed to marshal diversity constraint report", zap.Error(reportErr))
+			} else if reportErr = p.CacheClient.Set(ctx, cache.String(
+				cache.Key(cache.RecommendConstraintReport, userId), string(reportBytes),
+			)); reportErr != nil {
+				log.Logger().Error("failed to cache diversity constraint report", zap.Error(reportErr))
+			}
+		} else if err = p.CacheClient.Delete(ctx, cache.Key(cache.RecommendConstraintReport, userId)); err != nil {
+			log.Logger().Error("failed to clear stale diversity constraint report", zap.Error(err))
 		}
 	}); err != nil {
 		log.Logger().Error("recommendation was cancelled", zap.Error(err))
@@ -677,6 +737,34 @@ func (p *Pipeline) applyReplacementDecay(
 		cache.SortDocuments(updated)
 	}
 	return updated
+}
+
+// recordConstraintMetrics exports the per-generation folding, relaxation,
+// exhaustion and key-evaluation counters. Metric failures are impossible for
+// in-process Prometheus gauges, but any panic is still contained here so the
+// recommendation path is never affected.
+func (p *Pipeline) recordConstraintMetrics(userId string, report *logics.ConstraintReport) {
+	defer util.CheckPanic()
+	if report == nil {
+		return
+	}
+	DiversityConstraintFoldedTotal.Set(float64(report.Folded))
+	DiversityConstraintKeyFailureTotal.Set(float64(report.KeyFailureCount))
+	if report.Exhausted {
+		DiversityConstraintExhaustedTotal.Set(1)
+	} else {
+		DiversityConstraintExhaustedTotal.Set(0)
+	}
+	for level, count := range report.Relaxations {
+		DiversityConstraintRelaxTotal.WithLabelValues(level).Set(float64(count))
+	}
+	log.Logger().Debug("diversity constraint applied",
+		zap.String("user_id", userId),
+		zap.Int("candidates", report.Candidates),
+		zap.Int("folded", report.Folded),
+		zap.Int("returned", report.Returned),
+		zap.String("relax_level", logics.RelaxLevelName(report.RelaxLevel)),
+		zap.Bool("exhausted", report.Exhausted))
 }
 
 // ItemCache is alias of map[string]data.Item.

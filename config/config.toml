@@ -355,6 +355,30 @@ instructions_template = 'Would the user be interested in this repository? {{ ite
 # The fallback recommenders are used when cached recommendation drained out. The default values is ["latest"].
 recommenders = ["item-to-item/neighbors", "latest"]
 
+[recommend.diversity]
+
+# De-duplication group key expressed as an item expression (same expression
+# language as non-personalized recommenders). Items sharing the same key are
+# folded into one representative (highest score, stable tie-break). Empty
+# string disables de-duplication and keeps the legacy behavior unchanged.
+# Example: dedup_key = "item.Labels.series_id"
+dedup_key = ""
+
+# How an item belonging to several categories consumes the category budgets:
+#   all: the item counts against every category (default),
+#   primary: the item counts against its first category only.
+multi_label = "all"
+
+# Per-category diversity budgets. Categories absent from the list are only
+# bounded by the global sequence. When a budget cannot be satisfied the
+# constraints relax in a fixed order: max_consecutive, then max_ratio, then
+# max_count. A zero value disables that particular constraint.
+# [[recommend.diversity.categories]]
+# name = "movie"
+# max_count = 5
+# max_ratio = 0.4
+# max_consecutive = 2
+
 [tracing]
 
 # Enable tracing for REST APIs. The default value is false.

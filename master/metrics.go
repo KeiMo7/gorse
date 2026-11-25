@@ -213,6 +213,29 @@ var (
 		Subsystem: "master",
 		Name:      "memory_inuse_bytes",
 	}, []string{LabelData})
+
+	// DiversityRequestFoldedTotal counts items folded per serving request by
+	// the structural constraint engine.
+	DiversityRequestFoldedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "master",
+		Name:      "diversity_request_folded_total",
+	})
+	// DiversityRequestExhaustedTotal counts serving requests that returned
+	// fewer items than requested under the diversity budgets.
+	DiversityRequestExhaustedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "master",
+		Name:      "diversity_request_exhausted_total",
+	})
+	// DiversityRequestDegradedTotal counts serving requests where the stored
+	// generation artifact was missing or produced under another configuration
+	// and the serving side re-constrained the list itself.
+	DiversityRequestDegradedTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "gorse",
+		Subsystem: "master",
+		Name:      "diversity_request_degraded_total",
+	})
 )
 
 type OnlineEvaluator struct {

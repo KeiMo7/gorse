@@ -694,3 +694,49 @@ func (s *ValidateTestSuite) TestVectorStore() {
 	s.Database.VectorStore = "mysql://localhost:3306/gorse"
 	s.Error(s.Validate())
 }
+
+func TestDiversityConfigValidation(t *testing.T) {
+	// Duplicate category budgets are rejected at load time.
+	cfg := GetDefaultConfig()
+	cfg.Recommend.Diversity.Categories = []CategoryBudget{
+		{Name: "movie", MaxCount: 5, MaxRatio: 0.5, MaxConsecutive: 2},
+		{Name: "movie", MaxCount: 3},
+	}
+	assert.Error(t, cfg.Validate())
+
+	// Empty category names are rejected.
+	cfg = GetDefaultConfig()
+	cfg.Recommend.Diversity.Categories = []CategoryBudget{{Name: "", MaxCount: 1}}
+	assert.Error(t, cfg.Validate())
+
+	// Negative count, ratio above one and negative consecutive fail via tags.
+	cfg = GetDefaultConfig()
+	cfg.Recommend.Diversity.Categories = []CategoryBudget{{Name: "movie", MaxCount: -1}}
+	assert.Error(t, cfg.Validate())
+	cfg = GetDefaultConfig()
+	cfg.Recommend.Diversity.Categories = []CategoryBudget{{Name: "movie", MaxRatio: 1.5}}
+	assert.Error(t, cfg.Validate())
+	cfg = GetDefaultConfig()
+	cfg.Recommend.Diversity.Categories = []CategoryBudget{{Name: "movie", MaxConsecutive: -2}}
+	assert.Error(t, cfg.Validate())
+
+	// An invalid dedup key expression is rejected.
+	cfg = GetDefaultConfig()
+	cfg.Recommend.Diversity.DedupKey = "item.Labels."
+	assert.Error(t, cfg.Validate())
+
+	// A valid configuration passes and hashes differently when changed.
+	cfg = GetDefaultConfig()
+	cfg.Recommend.Diversity.DedupKey = "item.Labels.series_id"
+	cfg.Recommend.Diversity.Categories = []CategoryBudget{
+		{Name: "movie", MaxCount: 5, MaxRatio: 0.5, MaxConsecutive: 2},
+	}
+	assert.NoError(t, cfg.Validate())
+	hashA := cfg.Recommend.Hash()
+	cfg.Recommend.Diversity.Categories[0].MaxCount = 6
+	assert.NotEqual(t, hashA, cfg.Recommend.Hash())
+
+	// Disabled by default and when explicitly empty.
+	assert.False(t, DiversityConfig{}.Enabled())
+	assert.True(t, cfg.Recommend.Diversity.Enabled())
+}
